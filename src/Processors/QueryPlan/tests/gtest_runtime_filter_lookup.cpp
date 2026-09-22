@@ -1,8 +1,10 @@
 #include <gtest/gtest.h>
 
 #include <Columns/ColumnConst.h>
+#include <Columns/ColumnTuple.h>
 #include <Columns/ColumnsNumber.h>
 #include <DataTypes/DataTypeString.h>
+#include <DataTypes/DataTypeTuple.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Functions/FunctionFactory.h>
 #include <Processors/QueryPlan/RuntimeFilterLookup.h>
@@ -17,6 +19,7 @@
 #include <array>
 #include <barrier>
 #include <initializer_list>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <thread>
@@ -43,6 +46,19 @@ ColumnPtr makeUInt64Column(std::initializer_list<UInt64> values)
 ColumnWithTypeAndName makeUInt64ColumnWithType(std::initializer_list<UInt64> values, const DataTypePtr & type)
 {
     return ColumnWithTypeAndName(makeUInt64Column(values), type, "k");
+}
+
+ColumnPtr makeFloat64Column(std::initializer_list<Float64> values)
+{
+    auto column = ColumnFloat64::create();
+    for (const auto value : values)
+        column->insertValue(value);
+    return column;
+}
+
+ColumnWithTypeAndName makeFloat64ColumnWithType(std::initializer_list<Float64> values, const DataTypePtr & type)
+{
+    return ColumnWithTypeAndName(makeFloat64Column(values), type, "k");
 }
 
 void expectMask(ColumnPtr mask, std::initializer_list<UInt8> expected_values)
@@ -141,6 +157,48 @@ TEST(RuntimeFilterLookup, ApproximateRuntimeFilterQueriesBloomFilter)
     expectMask(filter.find(makeUInt64ColumnWithType({1, 3, 5}, type)), {1, 1, 1});
     EXPECT_EQ(filter.getStats().rows_checked.load(), 3);
     EXPECT_EQ(filter.getStats().rows_passed.load(), 3);
+}
+
+TEST(RuntimeFilterLookup, ExactSingletonPreservesNaNMembership)
+{
+    tryRegisterFunctions();
+    const auto type = std::make_shared<DataTypeFloat64>();
+    const Float64 nan = std::numeric_limits<Float64>::quiet_NaN();
+    RuntimeFilter filter(
+        /*filters_to_merge_=*/0,
+        makeRuntimeFilterConfig(),
+        RuntimeFilter::Adaptive(type, 1_MiB, 100, 3, 1.0, std::nullopt, false));
+
+    filter.insert(makeFloat64Column({nan}));
+    filter.finishInsert();
+
+    expectMask(filter.find(makeFloat64ColumnWithType({nan, 1.0}, type)), {1, 0});
+}
+
+TEST(RuntimeFilterLookup, ExactSingletonTuplePreservesNaNMembership)
+{
+    tryRegisterFunctions();
+    const auto float_type = std::make_shared<DataTypeFloat64>();
+    const auto uint_type = std::make_shared<DataTypeUInt64>();
+    const auto tuple_type = std::make_shared<DataTypeTuple>(DataTypes{float_type, uint_type});
+    const Float64 nan = std::numeric_limits<Float64>::quiet_NaN();
+
+    auto make_tuple_column = [](std::initializer_list<Float64> float_values, std::initializer_list<UInt64> uint_values)
+    {
+        return ColumnTuple::create(Columns{makeFloat64Column(float_values), makeUInt64Column(uint_values)});
+    };
+
+    RuntimeFilter filter(
+        /*filters_to_merge_=*/0,
+        makeRuntimeFilterConfig(),
+        RuntimeFilter::ExactContains(tuple_type, 1_MiB, 100));
+
+    filter.insert(make_tuple_column({nan}, {7}));
+    filter.finishInsert();
+
+    expectMask(
+        filter.find(ColumnWithTypeAndName(make_tuple_column({nan, nan, 1.0}, {7, 8, 7}), tuple_type, "k")),
+        {1, 0, 0});
 }
 
 TEST(RuntimeFilterLookup, PredictedBloomSaturationDropsKeySetAndPreservesMergedRange)

@@ -13,6 +13,7 @@
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypeSet.h>
+#include <DataTypes/DataTypeTuple.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/hasNullable.h>
 #include <Functions/FunctionFactory.h>
@@ -238,6 +239,24 @@ std::optional<Range> detail::RuntimeFilterIndexAnalysis::getRange() const
 namespace
 {
 
+bool typeContainsFloat(const DataTypePtr & type)
+{
+    const auto nested_type = removeNullable(recursiveRemoveLowCardinality(type));
+    if (WhichDataType(nested_type).isNativeFloat())
+        return true;
+
+    if (const auto * tuple_type = typeid_cast<const DataTypeTuple *>(nested_type.get()))
+    {
+        for (const auto & element_type : tuple_type->getElements())
+        {
+            if (typeContainsFloat(element_type))
+                return true;
+        }
+    }
+
+    return false;
+}
+
 void hashFixedSizeColumn(const char * raw_data, size_t value_size, size_t row_count, UInt64 seed, BloomFilterHashPair * out_hashes)
 {
     const char * position = raw_data;
@@ -367,8 +386,9 @@ void ExactSetRuntimeFilter<negate>::finishInsert()
     }
 
     /// If only one element is in the set then use `equals` instead of set lookup.
-    /// If the argument is `Nullable`, use `Set` because it can handle `NULL` values.
-    if (set.getTotalRowCount() == 1 && !argument_can_have_nulls)
+    /// If the argument is `Nullable` or contains a float, use `Set` because it handles `NULL`
+    /// values and uses the same NaN membership semantics as JOIN keys.
+    if (set.getTotalRowCount() == 1 && !argument_can_have_nulls && !typeContainsFloat(filter_column_target_type))
     {
         lookup_state = Single{set.getSetElements().front()};
         return;
@@ -660,31 +680,26 @@ ApproximateSetRuntimeFilter * AdaptiveSetRuntimeFilter::switchToApproximateFilte
     if (!exact_filter)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected state of AdaptiveSetRuntimeFilter");
     auto values = exact_filter->getValuesColumn();
-    UInt64 bytes_limit = exact_filter->getBytesLimit();
+    const auto bloom = sizeRuntimeBloomFilter(
+        RuntimeBloomFilterParameters{exact_filter->getBytesLimit(), bloom_filter_hash_functions},
+        distinct_keys_hint,
+        max_ratio_of_set_bits_in_bloom_filter);
 
-    if (distinct_keys_hint)
+    /// The filter size is capped, so a build side with more distinct keys would produce a Bloom filter
+    /// that `finishInsert` discards. Predict that fill rate before constructing it.
+    if (distinct_keys_hint && distinct_keys_hint_matches_filter_key)
     {
-        bytes_limit = growRuntimeBloomFilterBytesFromStats(
-            *distinct_keys_hint, bloom_filter_hash_functions, bytes_limit, max_ratio_of_set_bits_in_bloom_filter);
-
-        /// The filter size is capped, so a build side with more distinct keys would produce a Bloom filter
-        /// that `checkApproximateFilterWorthiness` discards. Predict that fill rate before constructing it.
-        if (distinct_keys_hint_matches_filter_key)
+        const double least_distinct_keys = static_cast<double>(*distinct_keys_hint) / HashJoinEntry::MAX_OVERESTIMATION_FACTOR;
+        const double predicted_fill_rate = estimateRuntimeBloomFilterSetBitsRatio(least_distinct_keys, bloom);
+        if (predicted_fill_rate > max_ratio_of_set_bits_in_bloom_filter)
         {
-            const double least_distinct_keys
-                = static_cast<double>(*distinct_keys_hint) / HashJoinEntry::MAX_OVERESTIMATION_FACTOR;
-            const double predicted_fill_rate = estimateRuntimeBloomFilterSetBitsRatio(
-                least_distinct_keys, RuntimeBloomFilterParameters{bytes_limit, bloom_filter_hash_functions});
-            if (predicted_fill_rate > max_ratio_of_set_bits_in_bloom_filter)
-            {
-                ProfileEvents::increment(ProfileEvents::RuntimeFilterBloomFilterBuildsSkipped);
-                dropKeySet(filter_);
-                return nullptr;
-            }
+            ProfileEvents::increment(ProfileEvents::RuntimeFilterBloomFilterBuildsSkipped);
+            dropKeySet(filter_);
+            return nullptr;
         }
     }
 
-    auto & approximate_filter = filter_.emplace<ApproximateSetRuntimeFilter>(bytes_limit, bloom_filter_hash_functions);
+    auto & approximate_filter = filter_.emplace<ApproximateSetRuntimeFilter>(bloom.bytes, bloom.hash_functions);
     approximate_filter.insert(values);
     return &approximate_filter;
 }
